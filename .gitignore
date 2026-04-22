@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+qwen3_looplm_checkpoint/
+*.pt
+*.bin
+*.safetensors
