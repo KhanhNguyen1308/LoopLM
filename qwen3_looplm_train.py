@@ -83,6 +83,10 @@ class LoopLMConfig:
     dataset_splits: list = field(default_factory=lambda: ["math", "code", "stem"])
     max_samples_per_split: int = 5000   # set None for full dataset
     max_seq_len: int = 2048
+    streaming: bool = False  # use streaming mode to avoid downloading all shards
+
+    # Memory
+    grad_checkpointing: bool = False  # gradient checkpointing to reduce VRAM usage
 
     # Training
     output_dir: str = "./qwen3_looplm_checkpoint"
@@ -341,15 +345,26 @@ class LoopLM(nn.Module):
         position_embeddings as a positional argument.
 
         Handles both old (tuple return) and new (tensor return) transformers API.
+        Supports gradient checkpointing via cfg.grad_checkpointing.
         """
-        for layer in layers:
+        use_ckpt = getattr(self.cfg, 'grad_checkpointing', False) and self.training
+
+        def _layer_fn(layer, hs):
             out = layer(
-                hidden_states,
+                hs,
                 position_ids=position_ids,
                 position_embeddings=position_embeddings,
                 cache_position=cache_position,
             )
-            hidden_states = out[0] if isinstance(out, tuple) else out
+            return out[0] if isinstance(out, tuple) else out
+
+        for layer in layers:
+            if use_ckpt:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    _layer_fn, layer, hidden_states, use_reentrant=False
+                )
+            else:
+                hidden_states = _layer_fn(layer, hidden_states)
         return hidden_states
 
     def forward(
@@ -453,7 +468,8 @@ class LoopLM(nn.Module):
 
 def load_nemotron_v2(cfg: LoopLMConfig, tokenizer):
     """
-    Load nvidia/Nemotron-Post-Training-Dataset-v2 (SFT config).
+    Load nvidia/Nemotron-Post-Training-Dataset-v2.
+    Config: default | Splits: math, code, stem, chat, multilingual_*
     Schema: {uuid, license, generator, version, category, reasoning, messages[{role, content}]}
     Returns a list of tokenized (input_ids, labels) pairs.
     """
@@ -464,13 +480,15 @@ def load_nemotron_v2(cfg: LoopLMConfig, tokenizer):
         log.info(f"  Fetching split '{split}'...")
         ds = load_dataset(
             cfg.dataset_id,
-            "SFT",
-            split=split,
-            streaming=False,
+            split=split,        # splits: math, code, stem, chat, multilingual_*
+            streaming=cfg.streaming,
         )
-        if cfg.max_samples_per_split:
+        if cfg.streaming:
+            ds = ds.take(cfg.max_samples_per_split) if cfg.max_samples_per_split else ds
+        elif cfg.max_samples_per_split:
             ds = ds.select(range(min(cfg.max_samples_per_split, len(ds))))
 
+        count = 0
         for sample in ds:
             messages = sample.get("messages", [])
             if not messages:
@@ -504,6 +522,9 @@ def load_nemotron_v2(cfg: LoopLMConfig, tokenizer):
             labels = mask_non_assistant(labels, ids, tokenizer)
 
             all_examples.append({"input_ids": ids, "labels": labels})
+            count += 1
+            if not cfg.streaming and cfg.max_samples_per_split and count >= cfg.max_samples_per_split:
+                break
 
     log.info(f"Total examples loaded: {len(all_examples)}")
     return all_examples
@@ -825,6 +846,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=CFG.batch_size)
     parser.add_argument("--lora_rank", type=int, default=CFG.lora_rank)
     parser.add_argument("--output_dir", type=str, default=CFG.output_dir)
+    parser.add_argument("--streaming", action="store_true", default=CFG.streaming)
+    parser.add_argument("--max_seq_len", type=int, default=CFG.max_seq_len)
+    parser.add_argument("--grad_checkpointing", action="store_true", default=CFG.grad_checkpointing)
     args = parser.parse_args()
 
     CFG.prelude_layers = args.prelude_layers
@@ -838,6 +862,9 @@ if __name__ == "__main__":
     CFG.batch_size = args.batch_size
     CFG.lora_rank = args.lora_rank
     CFG.output_dir = args.output_dir
+    CFG.streaming = args.streaming
+    CFG.max_seq_len = args.max_seq_len
+    CFG.grad_checkpointing = args.grad_checkpointing
 
     if args.sanity:
         sanity_check()
