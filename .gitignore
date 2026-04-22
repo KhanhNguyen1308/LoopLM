@@ -9,3 +9,4 @@ qwen3_looplm_checkpoint/
 *.pt
 *.bin
 *.safetensors
+bitsandbytes/

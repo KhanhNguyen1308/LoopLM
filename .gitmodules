@@ -1,0 +1,3 @@
+[submodule "bitsandbytes"]
+	path = bitsandbytes
+	url = https://github.com/bitsandbytes-foundation/bitsandbytes.git
